@@ -1,95 +1,25 @@
 import streamlit as st
-import sqlite3
+import psycopg2
 import json
 import hashlib
 import os
 
 # -----------------------------
-# DATABASE (same schema)
-# -----------------------------
-DB_NAME = "cars.db"
-
-@st.cache_resource
-def get_conn():
-    # check_same_thread=False is fine for Streamlit reruns
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
-
-conn = get_conn()
-cursor = conn.cursor()
-
-def init_db():
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        password TEXT
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS cars (
-        label TEXT,
-        username TEXT,
-        make TEXT,
-        model TEXT,
-        registration TEXT,
-        year TEXT,
-        PRIMARY KEY (label, username)
-    )
-    """)
-    conn.commit()
-
-# -----------------------------
-# PASSWORD HASHING (same logic)
-# -----------------------------
-def hash_password(plain_password: str) -> str:
-    salt = os.urandom(16).hex()
-    digest = hashlib.sha256((salt + plain_password).encode("utf-8")).hexdigest()
-    return f"{salt}${digest}"
-
-def verify_password(stored_value: str, entered_password: str) -> bool:
-    # New: salt$hash
-    if "$" in stored_value:
-        salt, digest = stored_value.split("$", 1)
-        check = hashlib.sha256((salt + entered_password).encode("utf-8")).hexdigest()
-        return check == digest
-    # Old: plaintext (backward compatibility)
-    return stored_value == entered_password
-
-def upgrade_password_if_plaintext(username: str, stored_value: str, entered_password: str):
-    if "$" not in stored_value and stored_value == entered_password:
-        cursor.execute(
-            "UPDATE users SET password = ? WHERE username = ?",
-            (hash_password(entered_password), username)
-        )
-        conn.commit()
-
-def create_default_admin():
-    cursor.execute("SELECT password FROM users WHERE username = 'admin'")
-    row = cursor.fetchone()
-
-    if row is None:
-        cursor.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
-            ("admin", hash_password("admin123"))
-        )
-        conn.commit()
-    else:
-        stored = row[0]
-        upgrade_password_if_plaintext("admin", stored, "admin123")
-
-init_db()
-create_default_admin()
-
-# -----------------------------
-# USER HELPERS
+# USER HELPERS (Postgres)
 # -----------------------------
 def user_exists(username: str) -> bool:
-    cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
-    return cursor.fetchone() is not None
+    return execute(
+        "SELECT 1 FROM users WHERE username = %s",
+        (username,),
+        fetchone=True
+    ) is not None
 
 def try_login(username: str, password: str) -> bool:
-    cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
+    row = execute(
+        "SELECT password FROM users WHERE username = %s",
+        (username,),
+        fetchone=True
+    )
     if not row:
         return False
 
@@ -102,31 +32,38 @@ def try_login(username: str, password: str) -> bool:
 def create_user(username: str, password: str) -> str:
     if user_exists(username):
         return f"User '{username}' already exists. Choose a different username."
-    cursor.execute(
-        "INSERT INTO users (username, password) VALUES (?, ?)",
+
+    execute(
+        "INSERT INTO users (username, password) VALUES (%s, %s)",
         (username, hash_password(password))
     )
-    conn.commit()
     return f"User '{username}' created successfully."
 
 def delete_user(username_to_delete: str) -> str:
     if username_to_delete.lower() == "admin":
         return "You cannot delete the admin account."
+
     if not user_exists(username_to_delete):
         return f"User '{username_to_delete}' does not exist."
 
-    cursor.execute("DELETE FROM cars WHERE username = ?", (username_to_delete,))
-    cursor.execute("DELETE FROM users WHERE username = ?", (username_to_delete,))
-    conn.commit()
+    # Delete cars first (also covered by ON DELETE CASCADE, but explicit is fine)
+    execute("DELETE FROM cars WHERE username = %s", (username_to_delete,))
+    execute("DELETE FROM users WHERE username = %s", (username_to_delete,))
     return f"User '{username_to_delete}' deleted successfully."
 
 def list_users():
-    cursor.execute("SELECT username FROM users ORDER BY username")
-    return [u for (u,) in cursor.fetchall()]
+    rows = execute(
+        "SELECT username FROM users ORDER BY username",
+        fetchall=True
+    ) or []
+    return [u for (u,) in rows]
 
 def change_password(username: str, current_pw: str, new_pw: str) -> str:
-    cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
+    row = execute(
+        "SELECT password FROM users WHERE username = %s",
+        (username,),
+        fetchone=True
+    )
     if not row:
         return "User not found."
 
@@ -137,62 +74,147 @@ def change_password(username: str, current_pw: str, new_pw: str) -> str:
     if new_pw == "":
         return "Password cannot be blank."
 
-    cursor.execute(
-        "UPDATE users SET password = ? WHERE username = ?",
+    execute(
+        "UPDATE users SET password = %s WHERE username = %s",
         (hash_password(new_pw), username)
     )
-    conn.commit()
     return "Password changed successfully."
 
+
+# -----------------------------
+# ADMIN CAR KEY HELPERS
+# -----------------------------
+def parse_car_key(key: str):
+    # format is "username :: label"
+    u, l = key.split(" :: ", 1)
+    return u, l
+
+# -----------------------------
+# DATABASE (Postgres via Neon)
+# -----------------------------
+@st.cache_resource
+def get_conn():
+    db_url = st.secrets["DATABASE_URL"]
+    return psycopg2.connect(db_url)
+
+def execute(query, params=(), fetchone=False, fetchall=False):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        # committing on every query is OK for simplicity
+        conn.commit()
+        if fetchone:
+            return cur.fetchone()
+        if fetchall:
+            return cur.fetchall()
+    return None
+
+def init_db():
+    execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL
+    )
+    """)
+
+    execute("""
+    CREATE TABLE IF NOT EXISTS cars (
+        label TEXT NOT NULL,
+        username TEXT NOT NULL,
+        make TEXT,
+        model TEXT,
+        registration TEXT,
+        year TEXT,
+        PRIMARY KEY (label, username),
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+    )
+    """)
+
+# -----------------------------
+# PASSWORD HASHING
+# -----------------------------
+def hash_password(plain_password: str) -> str:
+    salt = os.urandom(16).hex()
+    digest = hashlib.sha256((salt + plain_password).encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+def verify_password(stored_value: str, entered_password: str) -> bool:
+    if "$" in stored_value:
+        salt, digest = stored_value.split("$", 1)
+        check = hashlib.sha256((salt + entered_password).encode("utf-8")).hexdigest()
+        return check == digest
+    return stored_value == entered_password
+
+def upgrade_password_if_plaintext(username: str, stored_value: str, entered_password: str):
+    if "$" not in stored_value and stored_value == entered_password:
+        execute(
+            "UPDATE users SET password = %s WHERE username = %s",
+            (hash_password(entered_password), username)
+        )
+
+def create_default_admin():
+    row = execute("SELECT password FROM users WHERE username = 'admin'", fetchone=True)
+    if row is None:
+        execute(
+            "INSERT INTO users (username, password) VALUES (%s, %s)",
+            ("admin", hash_password("admin123"))
+        )
+    else:
+        stored = row[0]
+        upgrade_password_if_plaintext("admin", stored, "admin123")
+
+# Initialize DB + ensure admin exists
+init_db()
+create_default_admin()
 # -----------------------------
 # CAR HELPERS
 # -----------------------------
 def add_or_replace_car(username, label, make, model, registration, year):
-    cursor.execute("""
-        INSERT OR REPLACE INTO cars (label, username, make, model, registration, year)
-        VALUES (?, ?, ?, ?, ?, ?)
+    execute("""
+        INSERT INTO cars (label, username, make, model, registration, year)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (label, username)
+        DO UPDATE SET
+            make = EXCLUDED.make,
+            model = EXCLUDED.model,
+            registration = EXCLUDED.registration,
+            year = EXCLUDED.year
     """, (label, username, make, model, registration, year))
-    conn.commit()
-
 def get_car(username, label):
-    cursor.execute("""
+    return execute("""
         SELECT make, model, registration, year
         FROM cars
-        WHERE label = ? AND username = ?
-    """, (label, username))
-    return cursor.fetchone()
+        WHERE label = %s AND username = %s
+    """, (label, username), fetchone=True)
 
 def update_car(username, label, make, model, registration, year):
-    cursor.execute("""
+    execute("""
         UPDATE cars
-        SET make = ?, model = ?, registration = ?, year = ?
-        WHERE label = ? AND username = ?
+        SET make = %s, model = %s, registration = %s, year = %s
+        WHERE label = %s AND username = %s
     """, (make, model, registration, year, label, username))
-    conn.commit()
 
 def delete_car(username, label):
-    cursor.execute("""
+    execute("""
         DELETE FROM cars
-        WHERE label = ? AND username = ?
+        WHERE label = %s AND username = %s
     """, (label, username))
-    conn.commit()
 
 def list_car_labels(username):
-    cursor.execute("""
+    rows = execute("""
         SELECT label FROM cars
-        WHERE username = ?
+        WHERE username = %s
         ORDER BY label
-    """, (username,))
-    return [l for (l,) in cursor.fetchall()]
+    """, (username,), fetchall=True) or []
+    return [l for (l,) in rows]
 
 def export_cars_json(username):
-    cursor.execute("""
+    rows = execute("""
         SELECT label, make, model, registration, year
         FROM cars
-        WHERE username = ?
+        WHERE username = %s
         ORDER BY label
-    """, (username,))
-    rows = cursor.fetchall()
+    """, (username,), fetchall=True) or []
 
     data = []
     for label, make, model, registration, year in rows:
@@ -203,60 +225,43 @@ def export_cars_json(username):
             "registration": registration,
             "year": year
         })
-
     return json.dumps(data, indent=4)
 def list_all_car_keys(owner=None):
-    """
-    Admin: returns a list like 'username :: label'
-    If owner is provided, only that user's cars are returned.
-    """
     if owner:
-        cursor.execute("""
+        rows = execute("""
             SELECT username, label
             FROM cars
-            WHERE username = ?
+            WHERE username = %s
             ORDER BY username, label
-        """, (owner,))
+        """, (owner,), fetchall=True) or []
     else:
-        cursor.execute("""
+        rows = execute("""
             SELECT username, label
             FROM cars
             ORDER BY username, label
-        """)
-    rows = cursor.fetchall()
+        """, fetchall=True) or []
     return [f"{u} :: {l}" for u, l in rows]
 
-def parse_car_key(key: str):
-    u, l = key.split(" :: ", 1)
-    return u, l
-
 def get_car_any(user, label):
-    cursor.execute("""
+    return execute("""
         SELECT make, model, registration, year
         FROM cars
-        WHERE username = ? AND label = ?
-    """, (user, label))
-    return cursor.fetchone()
+        WHERE username = %s AND label = %s
+    """, (user, label), fetchone=True)
 
 def list_all_cars_rows(owner=None):
-    """
-    Admin: returns rows of (username, label, make, model, registration, year)
-    filtered by owner if provided.
-    """
     if owner:
-        cursor.execute("""
+        return execute("""
             SELECT username, label, make, model, registration, year
             FROM cars
-            WHERE username = ?
+            WHERE username = %s
             ORDER BY username, label
-        """, (owner,))
-    else:
-        cursor.execute("""
-            SELECT username, label, make, model, registration, year
-            FROM cars
-            ORDER BY username, label
-        """)
-    return cursor.fetchall()
+        """, (owner,), fetchall=True) or []
+    return execute("""
+        SELECT username, label, make, model, registration, year
+        FROM cars
+        ORDER BY username, label
+    """, fetchall=True) or []
 
 def export_all_cars_json(owner=None):
     rows = list_all_cars_rows(owner)
